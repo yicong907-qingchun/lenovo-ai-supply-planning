@@ -1,5 +1,4 @@
 from pathlib import Path
-import os
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException
@@ -16,8 +15,6 @@ MODEL_NAME = "gpt-6-luna"
 
 app = FastAPI(title="AI Supply Planning Copilot API")
 
-# Prototype setting so the Power BI custom visual can call this API.
-# For production, replace "*" with the exact allowed origin(s) if known.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -29,6 +26,7 @@ app.add_middleware(
 
 class AskRequest(BaseModel):
     question: str = Field(min_length=1)
+    api_key: str = Field(min_length=1)
     history: list[dict[str, str]] = Field(default_factory=list)
 
 
@@ -55,6 +53,7 @@ def load_context() -> pd.DataFrame:
 def load_snapshot():
     if not SNAPSHOT_FILE.exists():
         return None
+
     return pd.read_csv(SNAPSHOT_FILE)
 
 
@@ -74,11 +73,13 @@ def build_planning_context():
                 planning["Total Demand Qty"], errors="coerce"
             ).fillna(0).sum()
         )
+
         total_gap = float(
             pd.to_numeric(
                 planning["Supply Gap Qty"], errors="coerce"
             ).fillna(0).sum()
         )
+
         shortage_count = int(
             planning.loc[
                 pd.to_numeric(
@@ -87,9 +88,13 @@ def build_planning_context():
                 "MaterialID",
             ].nunique()
         )
+
         overall_coverage = (
-            (1 - total_gap / total_demand) * 100 if total_demand else 0.0
+            (1 - total_gap / total_demand) * 100
+            if total_demand
+            else 0.0
         )
+
     else:
         total_demand = 16839.0
         total_gap = 1744.0
@@ -143,34 +148,45 @@ Analysis rules:
    only when the supplied data supports that option.
 9. Answer in Chinese unless the user explicitly requests English.
 10. Be concise and planner-oriented. Prefer tables when comparing multiple materials.
-11. The Power BI page slicers do not define the question scope. Determine the requested
-    material, product, category, and time scope from the user's wording. If the user
-    names a MaterialID or material name, locate it directly in the supplied full dataset.
+11. The Power BI page slicers do not define the question scope.
+12. Determine the requested material, product, category, and time scope from the
+    user's wording.
+13. If the user names a MaterialID or material name, locate it directly in the
+    supplied full dataset.
 """.strip()
 
 
 @app.get("/")
 def health():
-    return {"status": "ok", "service": "AI Supply Planning Copilot API"}
+    return {
+        "status": "ok",
+        "service": "AI Supply Planning Copilot API",
+    }
 
 
 @app.post("/ask", response_model=AskResponse)
 def ask_ai(req: AskRequest):
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise HTTPException(
-            status_code=500,
-            detail="OPENAI_API_KEY is not configured on the server.",
-        )
 
     question = req.question.strip()
+    api_key = req.api_key.strip()
+
     if not question:
-        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+        raise HTTPException(
+            status_code=400,
+            detail="Question cannot be empty.",
+        )
+
+    if not api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="OpenAI API Key is required.",
+        )
 
     try:
         overall_context, planning_json = build_planning_context()
 
         recent_history = req.history[-6:]
+
         conversation_history = "\n".join(
             f"{item.get('role', '').upper()}: {item.get('content', '')}"
             for item in recent_history
@@ -192,16 +208,23 @@ Planner question:
 """.strip()
 
         client = OpenAI(api_key=api_key)
+
         response = client.responses.create(
             model=MODEL_NAME,
             instructions=INSTRUCTIONS,
             input=user_input,
         )
 
-        return AskResponse(answer=response.output_text)
+        return AskResponse(
+            answer=response.output_text
+        )
 
     except FileNotFoundError as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
+        raise HTTPException(
+            status_code=500,
+            detail=str(e),
+        ) from e
+
     except Exception as e:
         raise HTTPException(
             status_code=500,
